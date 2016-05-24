@@ -1,0 +1,45 @@
+// Type Definitions
+
+type ServerId : 1..3;
+type ClientId : 1..3;
+type RequestId : 1..99;
+
+type Server : record {
+  timeoutAt: Time,
+};
+
+type Client : record {
+  requestId: RequestId,
+  timeoutAt: Time,
+}
+
+// Protocol State
+
+var servers: Array<Server>[ServerId];
+var clients: Array<Client>[ClientId];
+
+// Useful functions
+
+function makeClientTimeout() -> Time {
+  return later(urandomRange(100000, 200000));
+}
+
+
+
+function init() {
+  for client in clients {
+    client.timeoutAt = makeClientTimeout();
+  }
+}
+
+// Initialization
+init();
+
+
+// State Transitions
+rule newRequest for clientId, client in clients {
+  if past(client.timeoutAt) {
+    client.requestId = client.requestId + 1;
+    client.timeoutAt = makeClientTimeout();
+  }
+}
