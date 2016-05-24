@@ -1,0 +1,24 @@
+{
+  "name": "runway-model-ios",
+  "version": "0.1.0",
+  "description": "Runway model of the ios consensus algorithm",
+  "keywords": [
+    "runway"
+  ],
+  "author": "Heidi Howard <hh360@cam.ac.uk>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/heidi-ann/runway-model-ios.git"
+  },
+  "models": [
+    {
+      "id": "ios",
+      "label": "Ios",
+      "spec": "ios.model",
+      "view": "ios.js",
+      "clock": "ms",
+      "speed": 50
+    }
+  ]
+}
