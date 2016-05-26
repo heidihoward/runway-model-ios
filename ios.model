@@ -4,19 +4,40 @@ type ServerId : 1..3;
 type ClientId : 1..3;
 type RequestId : 1..99;
 
+type NodeId : either {
+  ServerNode {id: ServerId},
+  ClientNode {id: ClientId},
+}
+
 type Server : record {
   timeoutAt: Time,
 };
 
 type Client : record {
   requestId: RequestId,
+  masterId: ServerId,
   timeoutAt: Time,
 }
+
+type Message : either {
+  ClientRequest {
+    requestId: RequestId
+  }
+}
+
+type Packet : record {
+  sentAt: Time,
+  sentBy: NodeId,
+  arriveAt: Time,
+  arriveTo: NodeId,
+  payload: Message,
+};
 
 // Protocol State
 
 var servers: Array<Server>[ServerId];
 var clients: Array<Client>[ClientId];
+var network: Set<Packet>[0..20];
 
 // Useful functions
 
@@ -24,11 +45,20 @@ function makeClientTimeout() -> Time {
   return later(urandomRange(100000, 200000));
 }
 
-
+function send(from: NodeId, to: NodeId, msg: Message) {
+  push(network, Packet {
+    sentAt: later(0),
+    sentBy: from,
+    arriveAt: later(urandomRange(10000, 20000)),
+    arriveTo: to,
+    payload: msg,
+  });
+}
 
 function init() {
   for client in clients {
     client.timeoutAt = makeClientTimeout();
+    client.masterId = 1;
   }
 }
 
@@ -39,7 +69,17 @@ init();
 // State Transitions
 rule newRequest for clientId, client in clients {
   if past(client.timeoutAt) {
+    send(
+       ClientNode {id: clientId},
+       ServerNode {id: 1},
+       ClientRequest {requestId: client.requestId});
     client.requestId = client.requestId + 1;
     client.timeoutAt = makeClientTimeout();
+  }
+}
+
+rule handleMessage for msg in network {
+  if past(msg.arriveAt) {
+    remove(network,msg);
   }
 }
