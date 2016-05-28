@@ -20,10 +20,21 @@ type MasterState : either {
   }
 }
 
+type Entry : record {
+  clientId: ClientId,
+  requestId: RequestId,
+  // actual request omitted
+}
+
+type Index: 1..10;
+type Log: Vector<Entry>[Index];
+
 type Server : record {
   timeoutAt: Time,
   view: View,
   stateMachine: Array<RequestId>[ClientId],
+  log: Log,
+  logIndex: Index,
   master: MasterState,
 };
 
@@ -129,6 +140,9 @@ rule handleMessage for msg in network {
         match servers[msg.arriveAt].master {
           Self {
             servers[msg.arriveAt].stateMachine[msg.sentBy] = data.requestId;
+            push(servers[msg.arriveAt].log,
+              Entry {clientId:msg.sentBy, requestId:data.requestId});
+            servers[msg.arriveAt].logIndex += 1;
             send(
               msg.sentBy,
               msg.arriveAt,
