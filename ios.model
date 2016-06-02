@@ -18,8 +18,9 @@ type Request: record {
 }
 
 type Entry: record  {
+  view: View,
+  committed: Boolean,
   request: Request,
-  committed: Boolean
 }
 type Index: 1..10;
 type Log: Vector<Entry>[Index];
@@ -175,7 +176,8 @@ rule handleMessage for msg in network {
           Self(state) {
             if state.prepare==0 {
               var request: Request = Request {clientId:msg.sentBy, requestId:data.requestId};
-              push(servers[msg.arriveAt].log, Entry{request:request, committed:False});
+              push(servers[msg.arriveAt].log,
+                Entry{view: servers[msg.arriveAt].view, committed:False, request:request});
               //state.prepare = 1;
               servers[msg.arriveAt].master = Self{prepare:1};
               sendAll(
@@ -236,7 +238,7 @@ rule handleMessage for msg in network {
                   msg.sentBy,
                   entry.request.clientId,
                   ClientResponse {requestId: entry.request.requestId, success: Successful});
-                servers[msg.arriveAt].log[data.index] = Entry {request:entry.request,committed:True};
+                servers[msg.arriveAt].log[data.index] = Entry {view: servers[msg.arriveAt].view, committed:True, request:entry.request};
                 sendAll(
                   msg.arriveAt,
                   CommitRequest{index:data.index,request:entry.request});
@@ -250,7 +252,7 @@ rule handleMessage for msg in network {
     CommitRequest(data) {
       servers[msg.arriveAt].commitIndex = data.index;
       servers[msg.arriveAt].stateMachine[data.request.clientId] = data.request.requestId;
-      servers[msg.arriveAt].log[data.index] = Entry {request:data.request,committed:True};
+      servers[msg.arriveAt].log[data.index] = Entry {view: servers[msg.arriveAt].view,committed:True, request:data.request};
     }
     CommitResponse {}
     }
