@@ -25,10 +25,15 @@ type Entry: record  {
 type Index: 1..10;
 type Log: Vector<Entry>[Index];
 
+type CoordinatorState : record {
+  request: Request,
+  prepare: ServerNum,
+  commit: ServerNum,
+}
+
 type MasterState : either {
   Self {
-    prepare: ServerNum,
-    commit: ServerNum,
+    coord: Set<CoordinatorState>[Index]
   },
   Other {
     masterId: ServerId,
