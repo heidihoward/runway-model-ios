@@ -138,19 +138,6 @@ function send(to: NodeId, from: NodeId, p: Payload) {
   });
 }
 
-// check all outstanding command to see if any can be applied
-function apply(id: ServerId) {
-  var index:Index = servers[id].commitIndex;
-  while index < servers[id].logIndex {
-    if servers[id].log[index].committed {
-      servers[id].stateMachine[servers[id].log[index].request.clientId] = servers[id].log[index].request.requestId;
-      servers[id].commitIndex = index;
-      index += 1;
-    }
-    else {break;}
-  }
-}
-
 function init() {
   for client in clients {
     client.timeoutAt = makeClientTimeout();
@@ -174,7 +161,7 @@ init();
 
 // State Transitions
 rule newRequest for clientId, client in clients {
-  if past(client.timeoutAt) {
+  if past(client.timeoutAt) && (client.requestId<=3) {
     if client.waiting {
       client.masterId = client.masterId + 1;
     } else {
@@ -271,11 +258,22 @@ rule handlePrepareResponse for msg in network {
               var request:Request = state.coord[data.index].request;
               var entry:Entry = Entry {view: servers[msg.arriveAt].view, committed:True, request:request};
               servers[msg.arriveAt].log[data.index] = entry;
-              apply(msg.arriveAt);
-              send(
-                msg.sentBy,
-                entry.request.clientId,
-                ClientResponse {requestId: request.requestId, success: Successful});
+              // check for outstanding entries
+              var index:Index = servers[msg.arriveAt].commitIndex;
+              while index < servers[msg.arriveAt].logIndex {
+                if servers[msg.arriveAt].log[index].committed {
+                  var commitRequest: Request = servers[msg.arriveAt].log[index].request;
+                  servers[msg.arriveAt].stateMachine[commitRequest.clientId] = commitRequest.requestId;
+                  servers[msg.arriveAt].commitIndex = index;
+                  index += 1;
+                  send(
+                    commitRequest.clientId,
+                    msg.arriveAt,
+                    ClientResponse {requestId: commitRequest.requestId, success: Successful});
+                }
+                else {break;}
+              }
+              state.coord[data.index].commit += 1;
               sendAll(
                 msg.arriveAt,
                 CommitRequest{index:data.index,request:request});
@@ -298,7 +296,20 @@ rule handleCommitRequest for msg in network {
       CommitRequest(data) {
         servers[msg.arriveAt].log[data.index] =
           Entry {view: servers[msg.arriveAt].view,committed:True, request:data.request};
-        apply(msg.arriveAt);
+        var index:Index = servers[msg.arriveAt].commitIndex;
+        while index < servers[msg.arriveAt].logIndex {
+          if servers[msg.arriveAt].log[index].committed {
+            var request: Request = servers[msg.arriveAt].log[index].request;
+            servers[msg.arriveAt].stateMachine[request.clientId] = request.requestId;
+            servers[msg.arriveAt].commitIndex = index;
+            index += 1;
+          }
+          else {break;}
+        }
+        send(
+          msg.sentBy,
+          msg.arriveAt,
+          CommitResponse {index: data.index, success:(servers[msg.arriveAt].commitIndex>=data.index) });
         remove(network,msg);
       }
     default {}
@@ -310,6 +321,13 @@ rule handleCommitResponse for msg in network {
   if past(msg.arriveBy) {
     match msg.payload {
       CommitResponse(data) {
+        match servers[msg.arriveAt].master {
+          Self(state) {
+            state.coord[data.index].commit += 1;
+            servers[msg.arriveAt].master = Self{coord:state.coord};
+          }
+        default {}
+        }
         remove(network,msg);
       }
     default {}
