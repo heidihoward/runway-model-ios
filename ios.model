@@ -172,9 +172,8 @@ rule newRequest for clientId, client in clients {
     }
 }
 
-rule handleMessage for msg in network {
+rule handleClientRequest for msg in network {
   if past(msg.arriveBy) {
-    remove(network,msg);
     match msg.payload {
       ClientRequest(data) {
         match servers[msg.arriveAt].master {
@@ -198,8 +197,16 @@ rule handleMessage for msg in network {
               ClientResponse {requestId: data.requestId, success:Unsuccessful {try:masterData.masterId}});
           }
         }
+      remove(network,msg);
+    }
+  default {}
+  }
+}
+}
 
-      }
+rule handleClientResponse for msg in network {
+  if past(msg.arriveBy) {
+    match msg.payload {
       ClientResponse(data) {
         if clients[msg.arriveAt].waiting &&
             data.requestId==clients[msg.arriveAt].requestId {
@@ -215,10 +222,17 @@ rule handleMessage for msg in network {
                   clients[msg.arriveAt].timeoutAt = later(clientRetry);
                 }
               }
-
             }
-
+        remove(network,msg);
       }
+    default {}
+    }
+  }
+}
+
+rule handlePrepareRequest for msg in network {
+  if past(msg.arriveBy) {
+    match msg.payload {
       PrepareRequest(data) {
         push(servers[msg.arriveAt].log, Entry{request:data.request,committed:False});
         servers[msg.arriveAt].logIndex += 1;
@@ -226,7 +240,16 @@ rule handleMessage for msg in network {
           msg.sentBy,
           msg.arriveAt,
           PrepareResponse {index: data.index, success:True});
-      }
+        remove(network,msg);
+        }
+    default {}
+    }
+  }
+}
+
+rule handlePrepareResponse for msg in network {
+  if past(msg.arriveBy) {
+    match msg.payload {
       PrepareResponse(data) {
         match servers[msg.arriveAt].master {
           Self(state) {
@@ -250,13 +273,34 @@ rule handleMessage for msg in network {
           }
           Other(masterData) {} // ignore
         }
+        remove(network,msg);
       }
-    CommitRequest(data) {
-      servers[msg.arriveAt].commitIndex = data.index;
-      servers[msg.arriveAt].stateMachine[data.request.clientId] = data.request.requestId;
-      servers[msg.arriveAt].log[data.index] = Entry {view: servers[msg.arriveAt].view,committed:True, request:data.request};
+    default {}
     }
-    CommitResponse {}
+  }
+}
+
+rule handleCommitRequest for msg in network {
+  if past(msg.arriveBy) {
+    match msg.payload {
+      CommitRequest(data) {
+        servers[msg.arriveAt].commitIndex = data.index;
+        servers[msg.arriveAt].stateMachine[data.request.clientId] = data.request.requestId;
+        servers[msg.arriveAt].log[data.index] = Entry {view: servers[msg.arriveAt].view,committed:True, request:data.request};
+        remove(network,msg);
+      }
+    default {}
+    }
+  }
+}
+
+rule handleCommitResponse for msg in network {
+  if past(msg.arriveBy) {
+    match msg.payload {
+      CommitResponse(data) {
+        remove(network,msg);
+      }
+    default {}
     }
   }
 }
