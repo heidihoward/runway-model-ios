@@ -33,7 +33,7 @@ type CoordinatorState : record {
 
 type MasterState : either {
   Self {
-    coord: Set<CoordinatorState>[Index]
+    coord: Vector<CoordinatorState>[Index]
   },
   Other {
     masterId: ServerId,
@@ -45,7 +45,7 @@ type Server : record {
   view: View,
   stateMachine: Array<RequestId>[ClientId],
   log: Log,
-  logIndex: Index,
+  logIndex: Index, //next free index
   commitIndex: Index,
   master: MasterState,
 };
@@ -178,19 +178,18 @@ rule handleMessage for msg in network {
     match msg.payload {
       ClientRequest(data) {
         match servers[msg.arriveAt].master {
-          Self(state) {
-            if state.prepare==0 {
+          Self(masterState) {
               var request: Request = Request {clientId:msg.sentBy, requestId:data.requestId};
+              var index: Index = servers[msg.arriveAt].logIndex;
+              servers[msg.arriveAt].logIndex += 1;
               push(servers[msg.arriveAt].log,
                 Entry{view: servers[msg.arriveAt].view, committed:False, request:request});
-              //state.prepare = 1;
-              servers[msg.arriveAt].master = Self{prepare:1};
+              push(masterState.coord,
+                 CoordinatorState{request:request, prepare: 1, commit:0});
               sendAll(
                 msg.arriveAt,
-                PrepareRequest {index: servers[msg.arriveAt].logIndex, request: request});
-            } else {
-              push(network,msg);
-            }
+                PrepareRequest {index: index, request: request});
+              servers[msg.arriveAt].master = Self{coord:masterState.coord};
           }
           Other(masterData) {
             send(
@@ -231,25 +230,23 @@ rule handleMessage for msg in network {
       PrepareResponse(data) {
         match servers[msg.arriveAt].master {
           Self(state) {
-            if data.index==servers[msg.arriveAt].logIndex {
-              state.prepare += 1;
-              if state.prepare>=majority {
-                servers[msg.arriveAt].commitIndex = data.index;
-                //state.prepare = 0;
-                servers[msg.arriveAt].master = Self{prepare:0};
-                var entry: Entry = servers[msg.arriveAt].log[data.index];
-                servers[msg.arriveAt].stateMachine[entry.request.clientId] = entry.request.requestId;
-                send(
-                  msg.sentBy,
-                  entry.request.clientId,
-                  ClientResponse {requestId: entry.request.requestId, success: Successful});
-                servers[msg.arriveAt].log[data.index] = Entry {view: servers[msg.arriveAt].view, committed:True, request:entry.request};
-                sendAll(
-                  msg.arriveAt,
-                  CommitRequest{index:data.index,request:entry.request});
-                servers[msg.arriveAt].logIndex += 1;
-              }
+            state.coord[data.index].prepare += 1;
+            if state.coord[data.index].prepare==majority {
+              servers[msg.arriveAt].commitIndex = data.index;
+              var request:Request = state.coord[data.index].request;
+              var entry:Entry = Entry {view: servers[msg.arriveAt].view, committed:True, request:request};
+              servers[msg.arriveAt].stateMachine[request.clientId] = request.requestId;
+              servers[msg.arriveAt].log[data.index] = entry;
+              send(
+                msg.sentBy,
+                entry.request.clientId,
+                ClientResponse {requestId: request.requestId, success: Successful});
+              sendAll(
+                msg.arriveAt,
+                CommitRequest{index:data.index,request:request});
             }
+          servers[msg.arriveAt].master = Self{coord:state.coord};
+
           }
           Other(masterData) {} // ignore
         }
