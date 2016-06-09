@@ -1,15 +1,15 @@
 // Type Definitions
 
-type ServerId : 1..3;
-type ServerNum: 0..3;
-type ClientId : 1..3;
+type ServerId : 1..5;
+type ServerNum: 0..5;
+type ClientId : 1..2;
 type RequestId : 0..99;
 type View: 1..9;
 
 type us: 0..10000000;
 type ms: 0..10000;
 
-type NodeId : 1..3;
+type NodeId : 1..5;
 
 type Request: record {
   clientId: ClientId,
@@ -32,9 +32,7 @@ type CoordinatorState : record {
 }
 
 type MasterState : either {
-  Self {
-    coord: Vector<CoordinatorState>[Index]
-  },
+  Self {},
   Other {
     masterId: ServerId,
     timeoutAt: Time,
@@ -48,6 +46,7 @@ type Server : record {
   logIndex: Index, //next free index
   commitIndex: Index,
   master: MasterState,
+  coordinator: Vector<CoordinatorState>[Index]
 };
 
 type Client : record {
@@ -82,7 +81,14 @@ type Payload : either {
   },
   CommitResponse {
     index: Index,
-    success: Boolean
+    success: Boolean,
+  },
+  CoordinateRequest {
+    index: Index,
+    request: Request,
+  },
+  CoordinateResponse {
+    success: Boolean,
   },
 }
 
@@ -123,6 +129,14 @@ function makeClientTimeout() -> Time {
 function sendAll(from: NodeId, p: Payload) {
   for serverId, server in servers {
     if serverId != from {
+      send(serverId, from, p);
+    }
+  }
+}
+
+function sendAllBut(from: NodeId, but: NodeId, p: Payload) {
+  for serverId, server in servers {
+    if serverId != from && serverId != but{
       send(serverId, from, p);
     }
   }
@@ -183,12 +197,11 @@ rule handleClientRequest for msg in network {
               servers[msg.arriveAt].logIndex += 1;
               push(servers[msg.arriveAt].log,
                 Entry{view: servers[msg.arriveAt].view, committed:False, request:request});
-              push(masterState.coord,
-                 CoordinatorState{request:request, prepare: 1, commit:0});
-              sendAll(
+              send(
+                msg.arriveAt+1,
                 msg.arriveAt,
-                PrepareRequest {index: index, request: request});
-              servers[msg.arriveAt].master = Self{coord:masterState.coord};
+                CoordinateRequest {index: index, request: request});
+
           }
           Other(masterData) {
             send(
@@ -251,40 +264,33 @@ rule handlePrepareResponse for msg in network {
   if past(msg.arriveBy) {
     match msg.payload {
       PrepareResponse(data) {
-        match servers[msg.arriveAt].master {
-          Self(state) {
-            state.coord[data.index].prepare += 1;
-            if state.coord[data.index].prepare==majority {
-              var request:Request = state.coord[data.index].request;
-              var entry:Entry = Entry {view: servers[msg.arriveAt].view, committed:True, request:request};
-              servers[msg.arriveAt].log[data.index] = entry;
-              // check for outstanding entries
-              var index:Index = servers[msg.arriveAt].commitIndex;
-              while index < servers[msg.arriveAt].logIndex {
-                if servers[msg.arriveAt].log[index].committed {
-                  var commitRequest: Request = servers[msg.arriveAt].log[index].request;
-                  servers[msg.arriveAt].stateMachine[commitRequest.clientId] = commitRequest.requestId;
-                  servers[msg.arriveAt].commitIndex = index;
-                  index += 1;
-                  send(
-                    commitRequest.clientId,
-                    msg.arriveAt,
-                    ClientResponse {requestId: commitRequest.requestId, success: Successful});
-                }
-                else {break;}
-              }
-              state.coord[data.index].commit += 1;
-              sendAll(
+        servers[msg.arriveAt].coordinator[data.index].prepare += 1;
+        if servers[msg.arriveAt].coordinator[data.index].prepare==majority {
+          var request:Request = servers[msg.arriveAt].coordinator[data.index].request;
+          var entry:Entry = Entry {view: servers[msg.arriveAt].view, committed:True, request:request};
+          servers[msg.arriveAt].log[data.index] = entry;
+          // check for outstanding entries
+          var index:Index = servers[msg.arriveAt].commitIndex;
+          while index < servers[msg.arriveAt].logIndex {
+            if servers[msg.arriveAt].log[index].committed {
+              var commitRequest: Request = servers[msg.arriveAt].log[index].request;
+              servers[msg.arriveAt].stateMachine[commitRequest.clientId] = commitRequest.requestId;
+              servers[msg.arriveAt].commitIndex = index;
+              index += 1;
+              send(
+                commitRequest.clientId,
                 msg.arriveAt,
-                CommitRequest{index:data.index,request:request});
+                ClientResponse {requestId: commitRequest.requestId, success: Successful});
             }
-          servers[msg.arriveAt].master = Self{coord:state.coord};
-
+            else {break;}
           }
-          Other(masterData) {} // ignore
+          servers[msg.arriveAt].coordinator[data.index].commit += 1;
+          sendAll(
+            msg.arriveAt,
+            CommitRequest{index:data.index,request:request});
         }
-        remove(network,msg);
-      }
+      remove(network,msg);
+    }
     default {}
     }
   }
@@ -321,13 +327,46 @@ rule handleCommitResponse for msg in network {
   if past(msg.arriveBy) {
     match msg.payload {
       CommitResponse(data) {
-        match servers[msg.arriveAt].master {
-          Self(state) {
-            state.coord[data.index].commit += 1;
-            servers[msg.arriveAt].master = Self{coord:state.coord};
-          }
-        default {}
-        }
+        servers[msg.arriveAt].coordinator[data.index].commit += 1;
+        remove(network,msg);
+      }
+    default {}
+    }
+  }
+}
+
+rule handleCoordinateRequest for msg in network {
+  if past(msg.arriveBy) {
+    match msg.payload {
+      CoordinateRequest(data) {
+        // replicate locally
+        servers[msg.arriveAt].logIndex += 1; // TODO: FIX ASSUMPTION
+        push(servers[msg.arriveAt].log,
+          Entry{view: servers[msg.arriveAt].view, committed:False, request:data.request});
+        // start prepare phase
+        push(servers[msg.arriveAt].coordinator,
+           CoordinatorState{request:data.request, prepare: 2, commit:0});
+        sendAllBut(
+          msg.arriveAt,
+          msg.sentBy,
+          PrepareRequest {index: data.index, request: data.request});
+        // reply to master
+        send(
+          msg.sentBy,
+          msg.arriveAt,
+          CoordinateResponse {success:True});
+        remove(network,msg);
+      }
+    default {}
+    }
+  }
+}
+
+rule handleCoordinateResponse for msg in network {
+  if past(msg.arriveBy) {
+    match msg.payload {
+      CoordinateResponse {
+        // do nothing
         remove(network,msg);
       }
     default {}
