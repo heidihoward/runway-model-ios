@@ -26,14 +26,22 @@ type Index: 1..10;
 type Log: Vector<Entry>[Index];
 
 type CoordinatorState : record {
-  request: Request,
+  index: Index,
   prepare: ServerNum,
   commit: ServerNum,
 }
 
+type Watcher: record {
+  index: Index,
+  assignedTo: ServerId,
+  timeoutAt: Time,
+}
+
 type MasterState : either {
   Unknown {},
-  Self {},
+  Self {
+    coordinators: Set<Watcher>[Index]
+    },
   Other {
     masterId: ServerId,
     timeoutAt: Time,
@@ -112,9 +120,9 @@ type Status: either {
 
 // Protocol State
 
-var serversMem: Array<ServerMem>[ServerId];
-var serversDisk: Array<ServerDisk>[ServerId];
 var serverStatus: Array<Status>[ServerId];
+var serversDisk: Array<ServerDisk>[ServerId];
+var serversMem: Array<ServerMem>[ServerId];
 var clients: Array<Client>[ClientId];
 var network: Set<Packet>[0..20];
 
@@ -124,6 +132,7 @@ var clientRetry : us = 100000;
 var netDelayMin : us = 5000;
 var netDelayMax : us = 10000;
 var FailureTimer : us = 30000;
+
 
 var majority:ServerNum = (size(serversMem)/2) +1;
 
@@ -203,6 +212,34 @@ init();
 
 
 // Internal state Transitions
+
+rule coordinatorFailed {
+  for id, server in serversMem {
+      match server.master {
+        Self(state) {
+          for watcher in state.coordinators {
+            if past(watcher.timeoutAt) {
+              if !serversDisk[id].log[watcher.index].committed {
+                send(watcher.assignedTo+1, id,
+                  CoordinateRequest {
+                    index: watcher.index,
+                    request: serversDisk[id].log[watcher.index].request});
+                push(state.coordinators,
+                  Watcher{
+                    index: watcher.index,
+                    assignedTo: watcher.assignedTo+1,
+                    timeoutAt: later(FailureTimer)});
+              }
+              remove(state.coordinators, watcher);
+              serversMem[id].master = Self{coordinators:state.coordinators};
+              }
+            }
+          }
+      default {}
+      }
+    }
+}
+
 rule newRequest for clientId, client in clients {
   if past(client.timeoutAt) && (client.requestId<=3) {
     if client.waiting {
@@ -221,16 +258,25 @@ rule handleClientRequest for msg in network {
       ClientRequest(data) {
         match serversMem[msg.arriveAt].master {
           Self(masterState) {
+              // replicate locally
               var request: Request = Request {clientId:msg.sentBy, requestId:data.requestId};
               var index: Index = serversMem[msg.arriveAt].logIndex;
               serversMem[msg.arriveAt].logIndex += 1;
               push(serversDisk[msg.arriveAt].log,
                 Entry{view: serversDisk[msg.arriveAt].view, committed:False, request:request});
+              // forward to coordinator
               send(
                 msg.arriveAt+1,
                 msg.arriveAt,
                 CoordinateRequest {index: index, request: request});
-
+              // timeout to detect failed coordinator
+              push(masterState.coordinators,
+                Watcher{
+                  index: index,
+                  assignedTo: msg.arriveAt+1,
+                  timeoutAt: later(FailureTimer),
+                });
+              serversMem[msg.arriveAt].master = Self{coordinators:masterState.coordinators};
           }
           Other(masterData) {
             send(
@@ -294,30 +340,34 @@ rule handlePrepareResponse for msg in network {
   if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       PrepareResponse(data) {
-        serversMem[msg.arriveAt].coordinator[data.index].prepare += 1;
-        if serversMem[msg.arriveAt].coordinator[data.index].prepare==majority {
-          var request:Request = serversMem[msg.arriveAt].coordinator[data.index].request;
-          var entry:Entry = Entry {view: serversDisk[msg.arriveAt].view, committed:True, request:request};
-          serversDisk[msg.arriveAt].log[data.index] = entry;
-          // check for outstanding entries
-          var index:Index = serversMem[msg.arriveAt].commitIndex;
-          while index < serversMem[msg.arriveAt].logIndex {
-            if serversDisk[msg.arriveAt].log[index].committed {
-              var commitRequest: Request = serversDisk[msg.arriveAt].log[index].request;
-              serversMem[msg.arriveAt].stateMachine[commitRequest.clientId] = commitRequest.requestId;
-              serversMem[msg.arriveAt].commitIndex = index;
-              index += 1;
-              send(
-                commitRequest.clientId,
+        for coordState in serversMem[msg.arriveAt].coordinator {
+          if data.index == coordState.index {
+            coordState.prepare += 1;
+            if coordState.prepare==majority {
+              var request:Request = serversDisk[msg.arriveAt].log[data.index].request;
+              var entry:Entry = Entry {view: serversDisk[msg.arriveAt].view, committed:True, request:request};
+              serversDisk[msg.arriveAt].log[data.index] = entry;
+              // check for outstanding entries
+              var index:Index = serversMem[msg.arriveAt].commitIndex;
+              while index < serversMem[msg.arriveAt].logIndex {
+                if serversDisk[msg.arriveAt].log[index].committed {
+                  var commitRequest: Request = serversDisk[msg.arriveAt].log[index].request;
+                  serversMem[msg.arriveAt].stateMachine[commitRequest.clientId] = commitRequest.requestId;
+                  serversMem[msg.arriveAt].commitIndex = index;
+                  index += 1;
+                  send(
+                    commitRequest.clientId,
+                    msg.arriveAt,
+                    ClientResponse {requestId: commitRequest.requestId, success: Successful});
+                }
+                else {break;}
+              }
+              coordState.commit += 1;
+              sendAll(
                 msg.arriveAt,
-                ClientResponse {requestId: commitRequest.requestId, success: Successful});
+                CommitRequest{index:data.index,request:request});
             }
-            else {break;}
           }
-          serversMem[msg.arriveAt].coordinator[data.index].commit += 1;
-          sendAll(
-            msg.arriveAt,
-            CommitRequest{index:data.index,request:request});
         }
       remove(network,msg);
     }
@@ -357,7 +407,14 @@ rule handleCommitResponse for msg in network {
   if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       CommitResponse(data) {
-        serversMem[msg.arriveAt].coordinator[data.index].commit += 1;
+        for coordState in serversMem[msg.arriveAt].coordinator {
+          if data.index == coordState.index {
+            coordState.commit += 1;
+            if coordState.commit == size(serversMem) {
+              remove(serversMem[msg.arriveAt].coordinator,coordState);
+            }
+          }
+        }
         remove(network,msg);
       }
     default {}
@@ -375,7 +432,7 @@ rule handleCoordinateRequest for msg in network {
           Entry{view: serversDisk[msg.arriveAt].view, committed:False, request:data.request});
         // start prepare phase
         push(serversMem[msg.arriveAt].coordinator,
-           CoordinatorState{request:data.request, prepare: 2, commit:0});
+           CoordinatorState{index:data.index, prepare: 2, commit:0});
         sendAllBut(
           msg.arriveAt,
           msg.sentBy,
