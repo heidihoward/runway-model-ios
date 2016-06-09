@@ -32,6 +32,7 @@ type CoordinatorState : record {
 }
 
 type MasterState : either {
+  Unknown {},
   Self {},
   Other {
     masterId: ServerId,
@@ -39,14 +40,17 @@ type MasterState : either {
   }
 }
 
-type Server : record {
-  view: View,
-  stateMachine: Array<RequestId>[ClientId],
-  log: Log,
+type ServerMem: record {
   logIndex: Index, //next free index
   commitIndex: Index,
+  stateMachine: Array<RequestId>[ClientId],
   master: MasterState,
   coordinator: Vector<CoordinatorState>[Index]
+}
+
+type ServerDisk : record {
+  view: View,
+  log: Log,
 };
 
 type Client : record {
@@ -108,7 +112,8 @@ type Status: either {
 
 // Protocol State
 
-var servers: Array<Server>[ServerId];
+var serversMem: Array<ServerMem>[ServerId];
+var serversDisk: Array<ServerDisk>[ServerId];
 var serverStatus: Array<Status>[ServerId];
 var clients: Array<Client>[ClientId];
 var network: Set<Packet>[0..20];
@@ -120,12 +125,12 @@ var netDelayMin : us = 5000;
 var netDelayMax : us = 10000;
 var FailureTimer : us = 30000;
 
-var majority:ServerNum = (size(servers)/2) +1;
+var majority:ServerNum = (size(serversMem)/2) +1;
 
 // Useful functions
 
 function getMasterId(view: View) -> ServerId {
- return view % size(servers); // FIX
+ return view % size(serversMem); // FIX
 }
 
 function makeClientTimeout() -> Time {
@@ -133,7 +138,7 @@ function makeClientTimeout() -> Time {
 }
 
 function sendAll(from: NodeId, p: Payload) {
-  for serverId, server in servers {
+  for serverId, server in serversMem {
     if serverId != from {
       send(serverId, from, p);
     }
@@ -141,7 +146,7 @@ function sendAll(from: NodeId, p: Payload) {
 }
 
 function sendAllBut(from: NodeId, but: NodeId, p: Payload) {
-  for serverId, server in servers {
+  for serverId, server in serversMem {
     if serverId != from && serverId != but{
       send(serverId, from, p);
     }
@@ -172,22 +177,25 @@ function init() {
     client.masterId = 1;
     client.requestId = 1;
   }
-  for serverId, server in servers {
+  for id, server in serversDisk {
     var masterId : ServerId = getMasterId(server.view);
-    if masterId==serverId {
-      server.master = Self {};
+    if masterId==id {
+      serversMem[id].master = Self {};
     } else {
-      server.master = Other {masterId: masterId, timeoutAt: later(FailureTimer)};
+      serversMem[id].master = Other {masterId: masterId, timeoutAt: later(FailureTimer)};
     }
   }
 
 }
 
-function loseVolatile(id: ServerId) {
-  var cleanServer: Server;
-  cleanServer.view = servers[id].view;
-  cleanServer.master = servers[id].master;
-  servers[id] = cleanServer;
+function stop(id: ServerId) {
+  var cleanServer: ServerMem;
+  serversMem[id] = cleanServer;
+}
+
+function restart(id: ServerId) {
+  serversMem[id].master = Other {masterId: getMasterId(serversDisk[id].view), timeoutAt: later(FailureTimer)};
+  serversMem[id].logIndex = size(serversDisk[id].log)+1;
 }
 
 // Initialization
@@ -211,13 +219,13 @@ rule handleClientRequest for msg in network {
   if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       ClientRequest(data) {
-        match servers[msg.arriveAt].master {
+        match serversMem[msg.arriveAt].master {
           Self(masterState) {
               var request: Request = Request {clientId:msg.sentBy, requestId:data.requestId};
-              var index: Index = servers[msg.arriveAt].logIndex;
-              servers[msg.arriveAt].logIndex += 1;
-              push(servers[msg.arriveAt].log,
-                Entry{view: servers[msg.arriveAt].view, committed:False, request:request});
+              var index: Index = serversMem[msg.arriveAt].logIndex;
+              serversMem[msg.arriveAt].logIndex += 1;
+              push(serversDisk[msg.arriveAt].log,
+                Entry{view: serversDisk[msg.arriveAt].view, committed:False, request:request});
               send(
                 msg.arriveAt+1,
                 msg.arriveAt,
@@ -230,6 +238,7 @@ rule handleClientRequest for msg in network {
               msg.arriveAt,
               ClientResponse {requestId: data.requestId, success:Unsuccessful {try:masterData.masterId}});
           }
+          default {}
         }
       remove(network,msg);
     }
@@ -268,8 +277,8 @@ rule handlePrepareRequest for msg in network {
   if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       PrepareRequest(data) {
-        push(servers[msg.arriveAt].log, Entry{request:data.request,committed:False});
-        servers[msg.arriveAt].logIndex += 1;
+        push(serversDisk[msg.arriveAt].log, Entry{request:data.request,committed:False});
+        serversMem[msg.arriveAt].logIndex += 1;
         send(
           msg.sentBy,
           msg.arriveAt,
@@ -285,18 +294,18 @@ rule handlePrepareResponse for msg in network {
   if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       PrepareResponse(data) {
-        servers[msg.arriveAt].coordinator[data.index].prepare += 1;
-        if servers[msg.arriveAt].coordinator[data.index].prepare==majority {
-          var request:Request = servers[msg.arriveAt].coordinator[data.index].request;
-          var entry:Entry = Entry {view: servers[msg.arriveAt].view, committed:True, request:request};
-          servers[msg.arriveAt].log[data.index] = entry;
+        serversMem[msg.arriveAt].coordinator[data.index].prepare += 1;
+        if serversMem[msg.arriveAt].coordinator[data.index].prepare==majority {
+          var request:Request = serversMem[msg.arriveAt].coordinator[data.index].request;
+          var entry:Entry = Entry {view: serversDisk[msg.arriveAt].view, committed:True, request:request};
+          serversDisk[msg.arriveAt].log[data.index] = entry;
           // check for outstanding entries
-          var index:Index = servers[msg.arriveAt].commitIndex;
-          while index < servers[msg.arriveAt].logIndex {
-            if servers[msg.arriveAt].log[index].committed {
-              var commitRequest: Request = servers[msg.arriveAt].log[index].request;
-              servers[msg.arriveAt].stateMachine[commitRequest.clientId] = commitRequest.requestId;
-              servers[msg.arriveAt].commitIndex = index;
+          var index:Index = serversMem[msg.arriveAt].commitIndex;
+          while index < serversMem[msg.arriveAt].logIndex {
+            if serversDisk[msg.arriveAt].log[index].committed {
+              var commitRequest: Request = serversDisk[msg.arriveAt].log[index].request;
+              serversMem[msg.arriveAt].stateMachine[commitRequest.clientId] = commitRequest.requestId;
+              serversMem[msg.arriveAt].commitIndex = index;
               index += 1;
               send(
                 commitRequest.clientId,
@@ -305,7 +314,7 @@ rule handlePrepareResponse for msg in network {
             }
             else {break;}
           }
-          servers[msg.arriveAt].coordinator[data.index].commit += 1;
+          serversMem[msg.arriveAt].coordinator[data.index].commit += 1;
           sendAll(
             msg.arriveAt,
             CommitRequest{index:data.index,request:request});
@@ -321,14 +330,14 @@ rule handleCommitRequest for msg in network {
   if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       CommitRequest(data) {
-        servers[msg.arriveAt].log[data.index] =
-          Entry {view: servers[msg.arriveAt].view,committed:True, request:data.request};
-        var index:Index = servers[msg.arriveAt].commitIndex;
-        while index < servers[msg.arriveAt].logIndex {
-          if servers[msg.arriveAt].log[index].committed {
-            var request: Request = servers[msg.arriveAt].log[index].request;
-            servers[msg.arriveAt].stateMachine[request.clientId] = request.requestId;
-            servers[msg.arriveAt].commitIndex = index;
+        serversDisk[msg.arriveAt].log[data.index] =
+          Entry {view: serversDisk[msg.arriveAt].view,committed:True, request:data.request};
+        var index:Index = serversMem[msg.arriveAt].commitIndex;
+        while index < serversMem[msg.arriveAt].logIndex {
+          if serversDisk[msg.arriveAt].log[index].committed {
+            var request: Request = serversDisk[msg.arriveAt].log[index].request;
+            serversMem[msg.arriveAt].stateMachine[request.clientId] = request.requestId;
+            serversMem[msg.arriveAt].commitIndex = index;
             index += 1;
           }
           else {break;}
@@ -336,7 +345,7 @@ rule handleCommitRequest for msg in network {
         send(
           msg.sentBy,
           msg.arriveAt,
-          CommitResponse {index: data.index, success:(servers[msg.arriveAt].commitIndex>=data.index) });
+          CommitResponse {index: data.index, success:(serversMem[msg.arriveAt].commitIndex>=data.index) });
         remove(network,msg);
       }
     default {}
@@ -348,7 +357,7 @@ rule handleCommitResponse for msg in network {
   if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       CommitResponse(data) {
-        servers[msg.arriveAt].coordinator[data.index].commit += 1;
+        serversMem[msg.arriveAt].coordinator[data.index].commit += 1;
         remove(network,msg);
       }
     default {}
@@ -361,11 +370,11 @@ rule handleCoordinateRequest for msg in network {
     match msg.payload {
       CoordinateRequest(data) {
         // replicate locally
-        servers[msg.arriveAt].logIndex += 1; // TODO: FIX ASSUMPTION
-        push(servers[msg.arriveAt].log,
-          Entry{view: servers[msg.arriveAt].view, committed:False, request:data.request});
+        serversMem[msg.arriveAt].logIndex += 1; // TODO: FIX ASSUMPTION
+        push(serversDisk[msg.arriveAt].log,
+          Entry{view: serversDisk[msg.arriveAt].view, committed:False, request:data.request});
         // start prepare phase
-        push(servers[msg.arriveAt].coordinator,
+        push(serversMem[msg.arriveAt].coordinator,
            CoordinatorState{request:data.request, prepare: 2, commit:0});
         sendAllBut(
           msg.arriveAt,
@@ -399,9 +408,10 @@ rule handleCoordinateResponse for msg in network {
 
 external nodeFailure for id, status in serverStatus {
   status = Offline;
-  loseVolatile(id);
+  stop(id);
 }
 
 external nodeRecovery for id, status in serverStatus {
   status = Online;
+  restart(id);
 }
