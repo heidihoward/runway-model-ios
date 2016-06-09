@@ -101,9 +101,15 @@ type Packet : record {
 
 };
 
+type Status: either {
+  Online,
+  Offline,
+};
+
 // Protocol State
 
 var servers: Array<Server>[ServerId];
+var serverStatus: Array<Status>[ServerId];
 var clients: Array<Client>[ClientId];
 var network: Set<Packet>[0..20];
 
@@ -152,6 +158,14 @@ function send(to: NodeId, from: NodeId, p: Payload) {
   });
 }
 
+function ready(msg: Packet) -> Boolean {
+  if past(msg.arriveBy) {
+    remove(network,msg);
+    return (serverStatus[msg.arriveAt]==Online);
+  }
+  return False;
+}
+
 function init() {
   for client in clients {
     client.timeoutAt = makeClientTimeout();
@@ -169,11 +183,18 @@ function init() {
 
 }
 
+function loseVolatile(id: ServerId) {
+  var cleanServer: Server;
+  cleanServer.view = servers[id].view;
+  cleanServer.master = servers[id].master;
+  servers[id] = cleanServer;
+}
+
 // Initialization
 init();
 
 
-// State Transitions
+// Internal state Transitions
 rule newRequest for clientId, client in clients {
   if past(client.timeoutAt) && (client.requestId<=3) {
     if client.waiting {
@@ -187,7 +208,7 @@ rule newRequest for clientId, client in clients {
 }
 
 rule handleClientRequest for msg in network {
-  if past(msg.arriveBy) {
+  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       ClientRequest(data) {
         match servers[msg.arriveAt].master {
@@ -218,7 +239,7 @@ rule handleClientRequest for msg in network {
 }
 
 rule handleClientResponse for msg in network {
-  if past(msg.arriveBy) {
+  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       ClientResponse(data) {
         if clients[msg.arriveAt].waiting &&
@@ -244,7 +265,7 @@ rule handleClientResponse for msg in network {
 }
 
 rule handlePrepareRequest for msg in network {
-  if past(msg.arriveBy) {
+  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       PrepareRequest(data) {
         push(servers[msg.arriveAt].log, Entry{request:data.request,committed:False});
@@ -261,7 +282,7 @@ rule handlePrepareRequest for msg in network {
 }
 
 rule handlePrepareResponse for msg in network {
-  if past(msg.arriveBy) {
+  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       PrepareResponse(data) {
         servers[msg.arriveAt].coordinator[data.index].prepare += 1;
@@ -297,7 +318,7 @@ rule handlePrepareResponse for msg in network {
 }
 
 rule handleCommitRequest for msg in network {
-  if past(msg.arriveBy) {
+  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       CommitRequest(data) {
         servers[msg.arriveAt].log[data.index] =
@@ -324,7 +345,7 @@ rule handleCommitRequest for msg in network {
 }
 
 rule handleCommitResponse for msg in network {
-  if past(msg.arriveBy) {
+  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       CommitResponse(data) {
         servers[msg.arriveAt].coordinator[data.index].commit += 1;
@@ -336,7 +357,7 @@ rule handleCommitResponse for msg in network {
 }
 
 rule handleCoordinateRequest for msg in network {
-  if past(msg.arriveBy) {
+  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
     match msg.payload {
       CoordinateRequest(data) {
         // replicate locally
@@ -363,7 +384,7 @@ rule handleCoordinateRequest for msg in network {
 }
 
 rule handleCoordinateResponse for msg in network {
-  if past(msg.arriveBy) {
+  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online{
     match msg.payload {
       CoordinateResponse {
         // do nothing
@@ -372,4 +393,15 @@ rule handleCoordinateResponse for msg in network {
     default {}
     }
   }
+}
+
+// External state Transitions
+
+external nodeFailure for id, status in serverStatus {
+  status = Offline;
+  loseVolatile(id);
+}
+
+external nodeRecovery for id, status in serverStatus {
+  status = Online;
 }
