@@ -182,7 +182,6 @@ function ready(msg: Packet) -> Boolean {
 
 function init() {
   for client in clients {
-    client.timeoutAt = makeClientTimeout();
     client.masterId = 1;
     client.requestId = 1;
   }
@@ -240,13 +239,17 @@ rule coordinatorFailed {
     }
 }
 
-rule newRequest for clientId, client in clients {
-  if past(client.timeoutAt) && (client.requestId<=3) {
-    if client.waiting {
-      client.masterId = client.masterId + 1;
-    } else {
-      client.waiting = True;
-    }
+external newRequest for clientId, client in clients {
+  if !client.waiting && client.requestId<=3 {
+    send(client.masterId, clientId, ClientRequest {requestId: client.requestId});
+    client.waiting = True;
+    client.timeoutAt = later(clientRetry);
+  }
+}
+
+rule retryRequest for clientId, client in clients {
+  if client.waiting && past(client.timeoutAt) {
+    client.masterId = client.masterId + 1;
     send(client.masterId, clientId, ClientRequest {requestId: client.requestId});
     client.timeoutAt = later(clientRetry);
     }
@@ -303,7 +306,6 @@ rule handleClientResponse for msg in network {
                 Successful {
                   clients[msg.arriveAt].requestId = clients[msg.arriveAt].requestId + 1;
                   clients[msg.arriveAt].waiting = False;
-                  clients[msg.arriveAt].timeoutAt = makeClientTimeout();
                 }
                 Unsuccessful(hint) {
                   clients[msg.arriveAt].masterId = hint.try;
