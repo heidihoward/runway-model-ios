@@ -14,19 +14,27 @@ let View = function (controller, svg, module) {
         .append('g')
         .attr('class','client');
     
+    function clientXTransform(clientData, clientIndex){
+        return 10 + clientIndex * 25;
+    }
+    
+    function clientYTransform(clientData, clientIndex){
+        return 30;
+    }
+
     // For each client draw a circle, dictating x pos by index
     clients
-	    .append('circle')
+	    .append('circle')   
 	    .style('fill', '#aaaaaa')
         .attr('r', 10)
-        .attr('cx', function (d, i) { return 10 + i * 25; })
-        .attr('cy', 30)
+        .attr('cx', clientXTransform)
+        .attr('cy', clientYTransform)
     
     // For each client create a text element and set the text to the value
     clients
 	    .append('text')
-        .attr('x', function (d, i) { return 10 + i * 25; })
-        .attr('y', 30)
+        .attr('x', clientXTransform)
+        .attr('y', clientYTransform)
         .style({
         'text-anchor': 'middle',
         'dominant-baseline': 'central',
@@ -51,7 +59,7 @@ let View = function (controller, svg, module) {
     
     // For each client add a path to represent timeout
     clients.append('path')
-        .attr("transform", function (d, i) { return "translate(" + (10 + i * 25) + "," + 30 + ")"; })
+        .attr("transform", function (d, i) { return "translate(" + clientXTransform(d,i) + "," + clientYTransform(d,i) + ")"; })
         .style('stroke','#000')
         .attr('class', 'path')
         .attr('d', arc);
