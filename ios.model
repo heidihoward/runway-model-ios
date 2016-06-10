@@ -1,16 +1,20 @@
-// Type Definitions
+// Ios consensus protocol specification in Runway
 
+// *** Type Definitions ***
+
+// Basic interger values
 type ServerId : 1..5;
 type ServerNum: 0..5;
 type ClientId : 1..2;
+type NodeId : 1..5;
 type RequestId : 0..99;
 type View: 1..9;
 
+// Time units
 type us: 0..10000000;
 type ms: 0..10000;
 
-type NodeId : 1..5;
-
+// Requests & logs
 type Request: either {
   Empty {},
   Occupied {
@@ -29,6 +33,7 @@ type Entry: record  {
 type Index: 1..5;
 type Log: Array<Entry>[Index];
 
+// Server state
 type CoordinatorState : record {
   index: Index,
   prepare: ServerNum,
@@ -37,7 +42,7 @@ type CoordinatorState : record {
 
 type RecoveryState : record {
   index: Index,
-  candidate: Request,
+  candidate: Entry,
   responses: ServerNum
 }
 
@@ -51,14 +56,21 @@ type MasterState : either {
   Unknown {},
   Self {
     coordinators: Set<Watcher>[Index],
+    recovery: Set<Watcher>[Index],
     nextHeartbeat: Time,
+    viewIndex: Index,
     },
+  Preparing {
+    recovery: Set<Watcher>[Index],
+    viewIndex: Index,
+  },
   Other {
     masterId: ServerId,
     timeoutAt: Time,
   }
 }
 
+// volatile server state
 type ServerMem: record {
   logIndex: Index, //next free index
   commitIndex: Index,
@@ -68,6 +80,7 @@ type ServerMem: record {
   recovery: Vector<RecoveryState>[Index],
 }
 
+// non-volatile server state
 type ServerDisk : record {
   view: View,
   log: Log,
@@ -76,6 +89,7 @@ type ServerDisk : record {
 type Client : record {
   requestId: RequestId,
   masterId: ServerId,
+  receivedAt: Time,
   timeoutAt: Time,
   waiting: Boolean
 }
@@ -135,14 +149,20 @@ type Payload : either {
     occupied: Boolean,
     entry: Entry,
   },
+  NewViewRequest {
+    view: View,
+  },
+  NewViewResponse {
+    index: Index
+  },
   Heartbeat,
 }
 
 type Packet : record {
   sentAt: Time,
-  sentBy : NodeId,
+  from : NodeId,
   arriveBy: Time,
-  arriveAt: NodeId,
+  to: NodeId,
   payload: Payload,
 
 };
@@ -153,13 +173,13 @@ type Status: either {
 };
 
 // Protocol State
-
 var serverStatus: Array<Status>[ServerId];
 var serversDisk: Array<ServerDisk>[ServerId];
 var serversMem: Array<ServerMem>[ServerId];
 var clients: Array<Client>[ClientId];
 var network: Set<Packet>[0..20];
 
+// Configation options
 var clientTimeoutMin : us = 100000;
 var clientTimeoutMax : us = 200000;
 var clientRetry : us = 100000;
@@ -198,9 +218,9 @@ function sendAllBut(from: NodeId, but: NodeId, p: Payload) {
 
 function send(to: NodeId, from: NodeId, p: Payload) {
   push(network, Packet {
-    sentBy: from,
+    from: from,
     sentAt: later(0),
-    arriveAt: to,
+    to: to,
     arriveBy: later(urandomRange(netDelayMin, netDelayMax)),
     payload: p,
   });
@@ -209,7 +229,7 @@ function send(to: NodeId, from: NodeId, p: Payload) {
 function ready(msg: Packet) -> Boolean {
   if past(msg.arriveBy) {
     remove(network,msg);
-    return (serverStatus[msg.arriveAt]==Online);
+    return (serverStatus[msg.to]==Online);
   }
   return False;
 }
@@ -247,6 +267,7 @@ function updateView(id: ServerId, view: View) {
     if nextMaster == id {
       // this node is the next master
       serversMem[id].master = Self {};
+      sendAll(id, NewViewRequest{view:view});
     } else {
       // wait for the expected new master
       serversMem[id].master = Other{
@@ -308,6 +329,7 @@ external newRequest for clientId, client in clients {
   if !client.waiting && client.requestId<=3 {
     send(client.masterId, clientId, ClientRequest {requestId: client.requestId});
     client.waiting = True;
+    client.receivedAt = later(0);
     client.timeoutAt = later(clientRetry);
   }
 }
@@ -333,13 +355,13 @@ rule dispatchHeartbeat for id, server in serversMem {
 }
 
 rule handleHeartbeat for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
     match msg.payload {
       Heartbeat {
-        match serversMem[msg.arriveAt].master {
+        match serversMem[msg.to].master {
           Other(state) {
-            if state.masterId==msg.sentBy {
-              serversMem[msg.arriveAt].master = Other{
+            if state.masterId==msg.from {
+              serversMem[msg.to].master = Other{
                 masterId: state.masterId,
                 timeoutAt:later(failureTimer)};
             }
@@ -353,36 +375,47 @@ rule handleHeartbeat for msg in network {
   }
 }
 
+// if master when write and forward request at given index to a coordinator
+function forward(id: ServerId, index: Index, request: Request) {
+  match serversMem[id].master {
+    Self(masterState) {
+      serversDisk[id].log[index] =
+        Entry{view: serversDisk[id].view, committed:False, request:request};
+      // forward to coordinator
+      send(
+        id+1,
+        id,
+        CoordinateRequest {index: index, request: request});
+      // timeout to detect failed coordinator
+      push(masterState.coordinators,
+        Watcher{
+          index: index,
+          assignedTo: id+1,
+          timeoutAt: later(failureTimer),
+        });
+      serversMem[id].master = Self{coordinators:masterState.coordinators};
+    }
+    default {}
+  }
+}
+
 rule handleClientRequest for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
     match msg.payload {
       ClientRequest(data) {
-        match serversMem[msg.arriveAt].master {
+        match serversMem[msg.to].master {
           Self(masterState) {
               // replicate locally
-              var request: Request = Occupied{clientId:msg.sentBy, requestId:data.requestId};
-              var index: Index = serversMem[msg.arriveAt].logIndex;
-              serversMem[msg.arriveAt].logIndex += 1;
-              serversDisk[msg.arriveAt].log[index] =
-                Entry{view: serversDisk[msg.arriveAt].view, committed:False, request:request};
-              // forward to coordinator
-              send(
-                msg.arriveAt+1,
-                msg.arriveAt,
-                CoordinateRequest {index: index, request: request});
-              // timeout to detect failed coordinator
-              push(masterState.coordinators,
-                Watcher{
-                  index: index,
-                  assignedTo: msg.arriveAt+1,
-                  timeoutAt: later(failureTimer),
-                });
-              serversMem[msg.arriveAt].master = Self{coordinators:masterState.coordinators};
+              var request: Request = Occupied{clientId:msg.from, requestId:data.requestId};
+              var index: Index = serversMem[msg.to].logIndex;
+              serversMem[msg.to].logIndex += 1;
+              // forward
+              forward(msg.to,index,request);
           }
           Other(masterData) {
             send(
-              msg.sentBy,
-              msg.arriveAt,
+              msg.from,
+              msg.to,
               ClientResponse {requestId: data.requestId, success:Unsuccessful {try:masterData.masterId}});
           }
           default {}
@@ -395,20 +428,20 @@ rule handleClientRequest for msg in network {
 }
 
 rule handleClientResponse for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
     match msg.payload {
       ClientResponse(data) {
-        if clients[msg.arriveAt].waiting &&
-            data.requestId==clients[msg.arriveAt].requestId {
+        if clients[msg.to].waiting &&
+            data.requestId==clients[msg.to].requestId {
               match data.success {
                 Successful {
-                  clients[msg.arriveAt].requestId = clients[msg.arriveAt].requestId + 1;
-                  clients[msg.arriveAt].waiting = False;
+                  clients[msg.to].requestId = clients[msg.to].requestId + 1;
+                  clients[msg.to].waiting = False;
                 }
                 Unsuccessful(hint) {
-                  clients[msg.arriveAt].masterId = hint.try;
-                  send(clients[msg.arriveAt].masterId, msg.arriveAt, ClientRequest {requestId: data.requestId});
-                  clients[msg.arriveAt].timeoutAt = later(clientRetry);
+                  clients[msg.to].masterId = hint.try;
+                  send(clients[msg.to].masterId, msg.to, ClientRequest {requestId: data.requestId});
+                  clients[msg.to].timeoutAt = later(clientRetry);
                 }
               }
             }
@@ -420,15 +453,15 @@ rule handleClientResponse for msg in network {
 }
 
 rule handlePrepareRequest for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
     match msg.payload {
       PrepareRequest(data) {
-        updateView(msg.arriveAt,data.view);
-        serversDisk[msg.arriveAt].log[serversMem[msg.arriveAt].logIndex] = Entry{request:data.request,committed:False};
-        serversMem[msg.arriveAt].logIndex += 1;
+        updateView(msg.to,data.view);
+        serversDisk[msg.to].log[serversMem[msg.to].logIndex] = Entry{request:data.request,committed:False};
+        serversMem[msg.to].logIndex += 1;
         send(
-          msg.sentBy,
-          msg.arriveAt,
+          msg.from,
+          msg.to,
           PrepareResponse {index: data.index, success:True});
       remove(network,msg);
         }
@@ -438,38 +471,38 @@ rule handlePrepareRequest for msg in network {
 }
 
 rule handlePrepareResponse for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
     match msg.payload {
       PrepareResponse(data) {
-        for coordState in serversMem[msg.arriveAt].coordinator {
+        for coordState in serversMem[msg.to].coordinator {
           if data.index == coordState.index {
             coordState.prepare += 1;
             if coordState.prepare==majority {
-              var request:Request = serversDisk[msg.arriveAt].log[data.index].request;
-              var entry:Entry = Entry {view: serversDisk[msg.arriveAt].view, committed:True, request:request};
-              serversDisk[msg.arriveAt].log[data.index] = entry;
+              var request:Request = serversDisk[msg.to].log[data.index].request;
+              var entry:Entry = Entry {view: serversDisk[msg.to].view, committed:True, request:request};
+              serversDisk[msg.to].log[data.index] = entry;
               // check for outstanding entries
-              var index:Index = serversMem[msg.arriveAt].commitIndex;
-              while index < serversMem[msg.arriveAt].logIndex {
-                if serversDisk[msg.arriveAt].log[index].committed {
-                  match serversDisk[msg.arriveAt].log[index].request {
+              var index:Index = serversMem[msg.to].commitIndex;
+              while index < serversMem[msg.to].logIndex {
+                if serversDisk[msg.to].log[index].committed {
+                  match serversDisk[msg.to].log[index].request {
                     Occupied(req) {
-                      serversMem[msg.arriveAt].stateMachine[req.clientId] = req.requestId;
+                      serversMem[msg.to].stateMachine[req.clientId] = req.requestId;
                       send(
                         req.clientId,
-                        msg.arriveAt,
+                        msg.to,
                         ClientResponse {requestId: req.requestId, success: Successful});
                     }
                     Empty {}
                   }
-                  serversMem[msg.arriveAt].commitIndex = index;
+                  serversMem[msg.to].commitIndex = index;
                   index += 1;
                 }
                 else {break;}
               }
               coordState.commit += 1;
               sendAll(
-                msg.arriveAt,
+                msg.to,
                 CommitRequest{index:data.index,request:request});
             }
           }
@@ -482,30 +515,30 @@ rule handlePrepareResponse for msg in network {
 }
 
 rule handleCommitRequest for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
     match msg.payload {
       CommitRequest(data) {
-        updateView(msg.arriveAt,data.view);
-        serversDisk[msg.arriveAt].log[data.index] =
-          Entry {view: serversDisk[msg.arriveAt].view,committed:True, request:data.request};
-        var index:Index = serversMem[msg.arriveAt].commitIndex;
-        while index < serversMem[msg.arriveAt].logIndex {
-          if serversDisk[msg.arriveAt].log[index].committed {
-            match serversDisk[msg.arriveAt].log[index].request {
+        updateView(msg.to,data.view);
+        serversDisk[msg.to].log[data.index] =
+          Entry {view: serversDisk[msg.to].view,committed:True, request:data.request};
+        var index:Index = serversMem[msg.to].commitIndex;
+        while index < serversMem[msg.to].logIndex {
+          if serversDisk[msg.to].log[index].committed {
+            match serversDisk[msg.to].log[index].request {
               Occupied(req) {
-                serversMem[msg.arriveAt].stateMachine[req.clientId] = req.requestId;
+                serversMem[msg.to].stateMachine[req.clientId] = req.requestId;
               }
               Empty {}
             }
-            serversMem[msg.arriveAt].commitIndex = index;
+            serversMem[msg.to].commitIndex = index;
             index += 1;
           }
           else {break;}
         }
         send(
-          msg.sentBy,
-          msg.arriveAt,
-          CommitResponse {index: data.index, success:(serversMem[msg.arriveAt].commitIndex>=data.index) });
+          msg.from,
+          msg.to,
+          CommitResponse {index: data.index, success:(serversMem[msg.to].commitIndex>=data.index) });
         remove(network,msg);
       }
     default {}
@@ -514,14 +547,14 @@ rule handleCommitRequest for msg in network {
 }
 
 rule handleCommitResponse for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
     match msg.payload {
       CommitResponse(data) {
-        for coordState in serversMem[msg.arriveAt].coordinator {
+        for coordState in serversMem[msg.to].coordinator {
           if data.index == coordState.index {
             coordState.commit += 1;
             if coordState.commit == size(serversMem) {
-              remove(serversMem[msg.arriveAt].coordinator,coordState);
+              remove(serversMem[msg.to].coordinator,coordState);
             }
           }
         }
@@ -533,25 +566,25 @@ rule handleCommitResponse for msg in network {
 }
 
 rule handleCoordinateRequest for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
     match msg.payload {
       CoordinateRequest(data) {
-        updateView(msg.arriveAt,data.view);
+        updateView(msg.to,data.view);
         // replicate locally
-        serversDisk[msg.arriveAt].log[data.index] =
-          Entry{view: serversDisk[msg.arriveAt].view, committed:False, request:data.request};
-        serversMem[msg.arriveAt].logIndex = data.index+1;
+        serversDisk[msg.to].log[data.index] =
+          Entry{view: serversDisk[msg.to].view, committed:False, request:data.request};
+        serversMem[msg.to].logIndex = data.index+1;
         // start prepare phase
-        push(serversMem[msg.arriveAt].coordinator,
+        push(serversMem[msg.to].coordinator,
            CoordinatorState{index:data.index, prepare: 2, commit:0});
         sendAllBut(
-          msg.arriveAt,
-          msg.sentBy,
-          PrepareRequest {view: serversDisk[msg.arriveAt].view,index: data.index, request: data.request});
+          msg.to,
+          msg.from,
+          PrepareRequest {view: serversDisk[msg.to].view,index: data.index, request: data.request});
         // reply to master
         send(
-          msg.sentBy,
-          msg.arriveAt,
+          msg.from,
+          msg.to,
           CoordinateResponse {success:True});
         remove(network,msg);
       }
@@ -561,7 +594,7 @@ rule handleCoordinateRequest for msg in network {
 }
 
 rule handleCoordinateResponse for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
     match msg.payload {
       CoordinateResponse {
         // do nothing
@@ -573,11 +606,11 @@ rule handleCoordinateResponse for msg in network {
 }
 
 function newest(a: Entry,b: Entry) -> Entry {
-  var emptye: Request = Empty{};
-  if a.request==emptye {
+  var emptyReq: Request = Empty{};
+  if a.request==emptyReq {
     return b;
   }
-  if b.request==emptye {
+  if b.request==emptyReq {
     return a;
   }
   if a.view > b.view {
@@ -587,12 +620,12 @@ function newest(a: Entry,b: Entry) -> Entry {
 }
 
 rule handleRecoveryRequest for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
     match msg.payload {
       RecoveryRequest(data) {
-        push(serversMem[msg.arriveAt].recovery,RecoveryState{
+        push(serversMem[msg.to].recovery,RecoveryState{
           index: data.index,
-          candidate: newest(data.entry,serversDisk[msg.arriveAt].log[data.index]),
+          candidate: newest(data.entry,serversDisk[msg.to].log[data.index]),
           responses: 2,
         });
         remove(network,msg);
@@ -602,16 +635,68 @@ rule handleRecoveryRequest for msg in network {
   }
 }
 
+rule handleRecoveryResponse for msg in network {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
+    match msg.payload {
+      RecoveryResponse(data) {
+        for recoveryState in serversMem[msg.to].recovery {
+          if data.index == recoveryState.index {
+              remove(serversMem[msg.to].recovery,recoveryState);
+              forward(msg.to,data.index,data.entry.request);
+          }
+        }
+        remove(network,msg);
+      }
+    default {}
+    }
+  }
+}
+
 rule handleQueryRequest for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
     match msg.payload {
       QueryRequest(data) {
-        var unoccupied: Entry;
-        var entry: Entry = serversDisk[msg.arriveAt].log[data.index];
-        send(msg.sentBy, msg.arriveAt, QueryResponse{
+        send(msg.from, msg.to, QueryResponse{
             index:data.index,
-            occupied:entry==unoccupied,
-            entry:entry});
+            entry:serversDisk[msg.to].log[data.index]});
+        remove(network,msg);
+      }
+    default {}
+    }
+  }
+}
+
+rule handleQueryResponse for msg in network {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
+    match msg.payload {
+      QueryResponse(data) {
+        for watcher in serversMem[msg.to].recovery {
+          if watcher.index == data.index {
+            watcher.candidate = newest(data.entry,watcher.candidate);
+            watcher.responses +=1;
+            if watcher.responses == majority {
+              send(1,msg.to,
+                RecoveryResponse{
+                  index:data.index,
+                  entry:watcher.candidate,
+                  });
+              remove(serversMem[msg.to].recovery,watcher);
+            }
+          }
+        }
+        remove(network,msg);
+      }
+    default {}
+    }
+  }
+}
+
+rule handleNewViewRequest for msg in network {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Online {
+    match msg.payload {
+      NewViewRequest(data) {
+        updateView(msg.to,data.view);
+        send(msg.from,msg.to,NewViewResponse{index:serversMem[msg.to].logIndex});
         remove(network,msg);
       }
     default {}
@@ -621,7 +706,7 @@ rule handleQueryRequest for msg in network {
 
 // TODO: test if we can remove online from all rules by making this rule first
 rule disgardMsgs for msg in network {
-  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Offline {
+  if past(msg.arriveBy) && serverStatus[msg.to]==Offline {
     remove(network,msg);
   }
 }
