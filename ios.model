@@ -26,8 +26,8 @@ type Entry: record  {
   request: Request,
 }
 
-type Index: 1..10;
-type Log: Vector<Entry>[Index];
+type Index: 1..5;
+type Log: Array<Entry>[Index];
 
 type CoordinatorState : record {
   index: Index,
@@ -38,6 +38,7 @@ type CoordinatorState : record {
 type RecoveryState : record {
   index: Index,
   candidate: Request,
+  responses: ServerNum
 }
 
 type Watcher: record {
@@ -64,7 +65,7 @@ type ServerMem: record {
   stateMachine: Array<RequestId>[ClientId],
   master: MasterState,
   coordinator: Vector<CoordinatorState>[Index],
-  recoveryCoordinator: Vector<RecoveryState>[Index],
+  recovery: Vector<RecoveryState>[Index],
 }
 
 type ServerDisk : record {
@@ -119,11 +120,11 @@ type Payload : either {
   RecoveryRequest {
     view: View,
     index: Index,
-    request: Request,
+    entry: Entry,
   },
   RecoveryResponse {
     index: Index,
-    request: Request,
+    entry: Entry,
   },
   QueryRequest {
     view: View,
@@ -132,7 +133,7 @@ type Payload : either {
   QueryResponse {
     index: Index,
     occupied: Boolean,
-    request: Request,
+    entry: Entry,
   },
   Heartbeat,
 }
@@ -236,7 +237,7 @@ function stop(id: ServerId) {
 
 function restart(id: ServerId) {
   serversMem[id].master = Other {masterId: getMasterId(serversDisk[id].view), timeoutAt: later(failureTimer)};
-  serversMem[id].logIndex = size(serversDisk[id].log)+1;
+  //serversMem[id].logIndex = size(serversDisk[id].log)+1; TODO: FIX
 }
 
 function updateView(id: ServerId, view: View) {
@@ -362,8 +363,8 @@ rule handleClientRequest for msg in network {
               var request: Request = Occupied{clientId:msg.sentBy, requestId:data.requestId};
               var index: Index = serversMem[msg.arriveAt].logIndex;
               serversMem[msg.arriveAt].logIndex += 1;
-              push(serversDisk[msg.arriveAt].log,
-                Entry{view: serversDisk[msg.arriveAt].view, committed:False, request:request});
+              serversDisk[msg.arriveAt].log[index] =
+                Entry{view: serversDisk[msg.arriveAt].view, committed:False, request:request};
               // forward to coordinator
               send(
                 msg.arriveAt+1,
@@ -423,7 +424,7 @@ rule handlePrepareRequest for msg in network {
     match msg.payload {
       PrepareRequest(data) {
         updateView(msg.arriveAt,data.view);
-        push(serversDisk[msg.arriveAt].log, Entry{request:data.request,committed:False});
+        serversDisk[msg.arriveAt].log[serversMem[msg.arriveAt].logIndex] = Entry{request:data.request,committed:False};
         serversMem[msg.arriveAt].logIndex += 1;
         send(
           msg.sentBy,
@@ -537,9 +538,9 @@ rule handleCoordinateRequest for msg in network {
       CoordinateRequest(data) {
         updateView(msg.arriveAt,data.view);
         // replicate locally
-        serversMem[msg.arriveAt].logIndex += 1; // TODO: FIX ASSUMPTION
-        push(serversDisk[msg.arriveAt].log,
-          Entry{view: serversDisk[msg.arriveAt].view, committed:False, request:data.request});
+        serversDisk[msg.arriveAt].log[data.index] =
+          Entry{view: serversDisk[msg.arriveAt].view, committed:False, request:data.request};
+        serversMem[msg.arriveAt].logIndex = data.index+1;
         // start prepare phase
         push(serversMem[msg.arriveAt].coordinator,
            CoordinatorState{index:data.index, prepare: 2, commit:0});
@@ -564,6 +565,53 @@ rule handleCoordinateResponse for msg in network {
     match msg.payload {
       CoordinateResponse {
         // do nothing
+        remove(network,msg);
+      }
+    default {}
+    }
+  }
+}
+
+function newest(a: Entry,b: Entry) -> Entry {
+  var emptye: Request = Empty{};
+  if a.request==emptye {
+    return b;
+  }
+  if b.request==emptye {
+    return a;
+  }
+  if a.view > b.view {
+    return a;
+  }
+  return b;
+}
+
+rule handleRecoveryRequest for msg in network {
+  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+    match msg.payload {
+      RecoveryRequest(data) {
+        push(serversMem[msg.arriveAt].recovery,RecoveryState{
+          index: data.index,
+          candidate: newest(data.entry,serversDisk[msg.arriveAt].log[data.index]),
+          responses: 2,
+        });
+        remove(network,msg);
+      }
+    default {}
+    }
+  }
+}
+
+rule handleQueryRequest for msg in network {
+  if past(msg.arriveBy) && serverStatus[msg.arriveAt]==Online {
+    match msg.payload {
+      QueryRequest(data) {
+        var unoccupied: Entry;
+        var entry: Entry = serversDisk[msg.arriveAt].log[data.index];
+        send(msg.sentBy, msg.arriveAt, QueryResponse{
+            index:data.index,
+            occupied:entry==unoccupied,
+            entry:entry});
         remove(network,msg);
       }
     default {}
