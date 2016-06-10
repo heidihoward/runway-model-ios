@@ -11,10 +11,13 @@ type ms: 0..10000;
 
 type NodeId : 1..5;
 
-type Request: record {
-  clientId: ClientId,
-  requestId: RequestId,
-  // actual request omitted
+type Request: either {
+  Empty {},
+  Occupied {
+    clientId: ClientId,
+    requestId: RequestId,
+    // actual request omitted
+  },
 }
 
 type Entry: record  {
@@ -22,6 +25,7 @@ type Entry: record  {
   committed: Boolean,
   request: Request,
 }
+
 type Index: 1..10;
 type Log: Vector<Entry>[Index];
 
@@ -29,6 +33,11 @@ type CoordinatorState : record {
   index: Index,
   prepare: ServerNum,
   commit: ServerNum,
+}
+
+type RecoveryState : record {
+  index: Index,
+  candidate: Request,
 }
 
 type Watcher: record {
@@ -54,7 +63,8 @@ type ServerMem: record {
   commitIndex: Index,
   stateMachine: Array<RequestId>[ClientId],
   master: MasterState,
-  coordinator: Vector<CoordinatorState>[Index]
+  coordinator: Vector<CoordinatorState>[Index],
+  recoveryCoordinator: Vector<RecoveryState>[Index],
 }
 
 type ServerDisk : record {
@@ -105,6 +115,24 @@ type Payload : either {
   },
   CoordinateResponse {
     success: Boolean,
+  },
+  RecoveryRequest {
+    view: View,
+    index: Index,
+    request: Request,
+  },
+  RecoveryResponse {
+    index: Index,
+    request: Request,
+  },
+  QueryRequest {
+    view: View,
+    index: Index,
+  },
+  QueryResponse {
+    index: Index,
+    occupied: Boolean,
+    request: Request,
   },
   Heartbeat,
 }
@@ -331,7 +359,7 @@ rule handleClientRequest for msg in network {
         match serversMem[msg.arriveAt].master {
           Self(masterState) {
               // replicate locally
-              var request: Request = Request {clientId:msg.sentBy, requestId:data.requestId};
+              var request: Request = Occupied{clientId:msg.sentBy, requestId:data.requestId};
               var index: Index = serversMem[msg.arriveAt].logIndex;
               serversMem[msg.arriveAt].logIndex += 1;
               push(serversDisk[msg.arriveAt].log,
@@ -423,14 +451,18 @@ rule handlePrepareResponse for msg in network {
               var index:Index = serversMem[msg.arriveAt].commitIndex;
               while index < serversMem[msg.arriveAt].logIndex {
                 if serversDisk[msg.arriveAt].log[index].committed {
-                  var commitRequest: Request = serversDisk[msg.arriveAt].log[index].request;
-                  serversMem[msg.arriveAt].stateMachine[commitRequest.clientId] = commitRequest.requestId;
+                  match serversDisk[msg.arriveAt].log[index].request {
+                    Occupied(req) {
+                      serversMem[msg.arriveAt].stateMachine[req.clientId] = req.requestId;
+                      send(
+                        req.clientId,
+                        msg.arriveAt,
+                        ClientResponse {requestId: req.requestId, success: Successful});
+                    }
+                    Empty {}
+                  }
                   serversMem[msg.arriveAt].commitIndex = index;
                   index += 1;
-                  send(
-                    commitRequest.clientId,
-                    msg.arriveAt,
-                    ClientResponse {requestId: commitRequest.requestId, success: Successful});
                 }
                 else {break;}
               }
@@ -458,8 +490,12 @@ rule handleCommitRequest for msg in network {
         var index:Index = serversMem[msg.arriveAt].commitIndex;
         while index < serversMem[msg.arriveAt].logIndex {
           if serversDisk[msg.arriveAt].log[index].committed {
-            var request: Request = serversDisk[msg.arriveAt].log[index].request;
-            serversMem[msg.arriveAt].stateMachine[request.clientId] = request.requestId;
+            match serversDisk[msg.arriveAt].log[index].request {
+              Occupied(req) {
+                serversMem[msg.arriveAt].stateMachine[req.clientId] = req.requestId;
+              }
+              Empty {}
+            }
             serversMem[msg.arriveAt].commitIndex = index;
             index += 1;
           }
