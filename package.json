@@ -20,5 +20,11 @@
       "clock": "ms",
       "speed": 50
     }
-  ]
+  ],
+  "devDependencies": {
+    "webpack": "~1.13.1",
+    "style-loader": "~0.13.1",
+    "css-loader": "~0.23.1",
+    "es6-promise": "~3.2.1"
+  }
 }
